@@ -8,13 +8,14 @@ GET /api/jobs/<id>/status, GET /api/jobs/<id>/download, DELETE /api/jobs/<id>)
 get added as more functions below, each registered the same way.
 """
 
-from flask import jsonify, request
+from flask import jsonify, request, send_file
 
 from plugins.registry import get_platform_list, get_plugin_class
 from database.db import (
-    create_job, get_job, list_jobs, get_reviews_for_job
+    create_job, get_job, list_jobs, get_reviews_for_job, delete_job as db_delete_job
 )
 from services.job_runner import start_job_thread
+from services.export import export_reviews, SUPPORTED_FORMATS
 
 
 def register_routes(app):
@@ -111,3 +112,34 @@ def register_routes(app):
             "branch_total": job["branch_total"],
             "reviews_so_far": job["reviews_so_far"],
         })
+
+    @app.route("/api/jobs/<job_id>/download", methods=["GET"])
+    def download_job(job_id):
+        """
+        Downloads a job's reviews as a file. Format via ?format=xlsx|csv|json
+        (defaults to xlsx). Example: /api/jobs/<id>/download?format=csv
+        """
+        job = get_job(job_id)
+        if job is None:
+            return jsonify({"error": "Job not found"}), 404
+
+        if job["status"] != "done":
+            return jsonify({"error": f"Job is not finished yet (status: {job['status']})"}), 400
+
+        fmt = request.args.get("format", "xlsx").lower()
+        if fmt not in SUPPORTED_FORMATS:
+            return jsonify({"error": f"Unsupported format '{fmt}'. Must be one of {sorted(SUPPORTED_FORMATS)}"}), 400
+
+        reviews = get_reviews_for_job(job_id)
+        business_name = job["job_params"].get("business_name", "job")
+        file_path = export_reviews(reviews, business_name, job_id, fmt=fmt)
+
+        return send_file(file_path, as_attachment=True)
+
+    @app.route("/api/jobs/<job_id>", methods=["DELETE"])
+    def delete_job_route(job_id):
+        """Deletes a job and all its reviews (cascade)."""
+        deleted = db_delete_job(job_id)
+        if not deleted:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify({"deleted": True})
