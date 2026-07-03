@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+database/reviews.db
+checkpoints/
+plugins/debug_screenshots/
+plugins/.chromedriver_path_cache.json
+test_checkpoint.json
+job.json
