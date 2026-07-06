@@ -53,13 +53,22 @@ GET /api/platforms
     "name": "Google Maps",
     "fields": [
       { "id": "business_name", "label": "Business Name", "type": "text", "required": true, "default": null },
-      { "id": "location", "label": "Location", "type": "text", "required": false, "default": null },
+      { "id": "locations", "label": "Specific Locations (optional, leave empty for all locations)", "type": "multi_text", "required": false, "default": null },
       { "id": "max_reviews", "label": "Max Reviews per Branch", "type": "number", "required": false, "default": 5000 }
     ]
   }
 ]
 ```
-**How to use this for Screen 3 (Job Details):** don't hardcode form fields per platform. Render one input per item in `fields`, using `label` as the field's display label, `type` to pick the input type (`text` / `number`), and `required` to mark it mandatory. This means new platforms (Trustpilot, Yelp, etc.) automatically get a working form with zero frontend changes once the backend adds them.
+**How to use this for Screen 3 (Job Details):** don't hardcode form fields per platform. Render one input per item in `fields`, using `label` as the field's display label, `type` to pick the input type, and `required` to mark it mandatory. This means new platforms (Trustpilot, Yelp, etc.) automatically get a working form with zero frontend changes once the backend adds them.
+
+**Special field type: `multi_text`** (currently used by `locations`) — render this as a **tag/chip input**: an "Add Location" button that lets the user add zero, one, or several location values (e.g. "Lahore", "Karachi"). Send it to the backend as a JSON array:
+```json
+"locations": ["Lahore", "Karachi"]
+```
+- **Empty array or field omitted entirely** → searches the business name with no location filter, returning whatever Google Maps' own search surfaces (effectively "all locations" it knows about).
+- **One value** → searches that single location.
+- **Multiple values** → the backend searches each one, combines every branch found across all of them, and returns **one single job with one combined result** (not separate jobs/files per location) — so the download button on Screen 5 still only needs to handle one file per job, regardless of how many locations were searched.
+- A single value can also be a country or region name (e.g. `"Pakistan"`) — it's treated the same way, just as a search term. How many branches actually come back depends on what Google Maps itself surfaces for that search; it isn't guaranteed to be a literal exhaustive list if the chain has a very large number of locations.
 
 ---
 
@@ -74,7 +83,7 @@ Content-Type: application/json
 {
   "platform": "google_maps",
   "business_name": "Ajwa Bakers & Restaurants",
-  "location": "Lala Musa",
+  "locations": ["Lala Musa"],
   "max_reviews": 5000
 }
 ```
@@ -130,7 +139,7 @@ GET /api/jobs/<job_id>
   "job": {
     "id": "819eaeeb-bf83-4e4a-9b9b-f5618033a53d",
     "platform": "google_maps",
-    "job_params": { "business_name": "Ajwa Bakers & Restaurants", "location": "Lala Musa", "max_reviews": 5000 },
+    "job_params": { "business_name": "Ajwa Bakers & Restaurants", "locations": ["Lala Musa"], "max_reviews": 5000 },
     "status": "done",
     "branch_current": 1,
     "branch_total": 1,

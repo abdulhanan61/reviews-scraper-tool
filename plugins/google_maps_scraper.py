@@ -85,6 +85,26 @@ _DRIVER_PATH_CACHE_FILE = os.path.join(
 
 # ----------------------------- helpers -------------------------------
 
+_PLACE_ID_PATTERN = re.compile(r'0x[0-9a-fA-F]+:0x[0-9a-fA-F]+')
+
+
+def extract_place_id(url: str) -> str:
+    """
+    Google Maps place URLs contain a stable ID like '0x391f...:0x54ae...'
+    that identifies the SAME physical place no matter which search query
+    led to it. This matters because when a searched location has no branch
+    of its own, Google Maps silently redirects that search to the nearest/
+    best-matching existing branch instead -- and the resulting URL has
+    different tracking parameters even though it's the identical place.
+    Comparing raw URLs misses this and causes the same branch to be scraped
+    twice under two different location labels. Falls back to the full URL
+    if no ID pattern is found (better to risk a rare duplicate than to
+    accidentally merge two different real places together).
+    """
+    match = _PLACE_ID_PATTERN.search(url or "")
+    return match.group(0) if match else url
+
+
 def extract_city(address: str) -> str:
     """
     Given a full Google Maps address ('Shop 4, Main Bazar, Gujrat, Punjab,
@@ -177,6 +197,8 @@ def setup_driver(headless=HEADLESS):
         pass
 
     return driver
+
+
 
 
 def real_scroll(driver, element, amount=SCROLL_AMOUNT):
@@ -577,7 +599,8 @@ class GoogleMapsScraper(ScraperPlugin):
     platform_name = "Google Maps"
     fields = [
         PluginField(id="business_name", label="Business Name", type="text", required=True),
-        PluginField(id="location", label="Location", type="text", required=False),
+        PluginField(id="locations", label="Specific Locations (optional, leave empty for all locations)",
+                    type="multi_text", required=False),
         PluginField(id="max_reviews", label="Max Reviews per Branch", type="number",
                     required=False, default=5000),
     ]
@@ -585,9 +608,36 @@ class GoogleMapsScraper(ScraperPlugin):
     def __init__(self, job_params: dict, checkpoint_file=None, headless=HEADLESS):
         super().__init__(job_params, checkpoint_file=checkpoint_file)
         business_name = job_params.get("business_name", "")
-        location = job_params.get("location")
-        self.query = f"{business_name} {location}".strip() if location else business_name
-        self.max_reviews_per_branch = job_params.get("max_reviews", 5000)
+
+        # Accept multiple input shapes for backward compatibility:
+        #   "locations": ["Lahore", "Karachi"]   <- preferred, from a tag-input UI
+        #   "location": "Lahore, Karachi"        <- comma-separated string also works
+        #   "location": "Pakistan"               <- a single country/city/area also works,
+        #                                            it's just appended to the search same as a city
+        #   nothing at all                       <- searches business_name alone (all locations
+        #                                            Google Maps' own search surfaces)
+        locations = job_params.get("locations")
+        if not locations:
+            raw_location = job_params.get("location")
+            if isinstance(raw_location, list):
+                locations = [str(l).strip() for l in raw_location if str(l).strip()]
+            elif raw_location:
+                locations = [l.strip() for l in raw_location.split(",")]
+            else:
+                locations = []
+            locations = [l for l in locations if l]  # drop empty entries from stray commas
+
+        self.locations = locations or [None]  # [None] means: one search, no location suffix
+        self.business_name = business_name
+        self.queries = [
+            f"{business_name} {loc}".strip() if loc else business_name
+            for loc in self.locations
+        ]
+        raw_max_reviews = job_params.get("max_reviews")
+        try:
+            self.max_reviews_per_branch = int(raw_max_reviews) if raw_max_reviews not in (None, "") else 5000
+        except (TypeError, ValueError):
+            self.max_reviews_per_branch = 5000
         self.headless = headless
 
     # -- checkpointing --
@@ -616,8 +666,26 @@ class GoogleMapsScraper(ScraperPlugin):
         completed = set(state["completed_branch_urls"])
 
         try:
-            branch_links = get_all_branch_links(driver, self.query)
+            # Combine branches from every location into ONE list -- this is what
+            # makes multiple locations produce a single job / single output file
+            # instead of separate ones per location.
+            branch_links = []
+            seen_place_ids = set()
+            for loc, query in zip(self.locations, self.queries):
+                for branch in get_all_branch_links(driver, query):
+                    place_id = extract_place_id(branch["url"])
+                    if place_id not in seen_place_ids:
+                        seen_place_ids.add(place_id)
+                        branch["source_location"] = loc  # None if no location was given for this query
+                        branch_links.append(branch)
+                    elif VERBOSE_DEBUG:
+                        print(f"  [debug] skipping duplicate place (already found via another "
+                              f"location search): {branch.get('label') or branch['url']}")
+
             total_branches = len(branch_links)
+            if VERBOSE_DEBUG:
+                print(f"Combined total across {len(self.queries)} location(s): "
+                      f"{total_branches} unique branch(es)")
 
             for idx, branch in enumerate(branch_links, start=1):
                 branch_url = branch["url"]
@@ -670,7 +738,18 @@ class GoogleMapsScraper(ScraperPlugin):
                 print("  Could not open Reviews tab -- skipping branch.")
             return None
 
-        location = get_business_location(driver, branch_label, fallback=self.query)
+        # Build the richest fallback we can: business name + the location we
+        # searched to find this specific branch + whatever label Google Maps
+        # itself gave this listing in the results panel. This only gets used
+        # if the actual on-page address selectors fail to match, but it needs
+        # to be branch-specific -- otherwise every branch falls back to the
+        # exact same generic business name and the Location column becomes
+        # useless for telling branches apart.
+        source_location = branch.get("source_location")
+        fallback_parts = [p for p in [self.business_name, source_location] if p]
+        fallback = " ".join(fallback_parts) if fallback_parts else (branch_label or self.business_name)
+
+        location = get_business_location(driver, branch_label, fallback=fallback)
         if VERBOSE_DEBUG:
             print(f"  Location: {location}")
 
@@ -696,7 +775,9 @@ def _cli_main():
     import argparse
     parser = argparse.ArgumentParser(description="Google Maps review scraper")
     parser.add_argument("business_name")
-    parser.add_argument("--location", default=None)
+    parser.add_argument("--location", default=None,
+                         help="one location, or multiple comma-separated (e.g. 'Lahore,Karachi'). "
+                              "Leave empty to search all locations.")
     parser.add_argument("--max-reviews", type=int, default=5000)
     parser.add_argument("--output", default="reviews.xlsx")
     parser.add_argument("--checkpoint", default="scrape_checkpoint.json")
